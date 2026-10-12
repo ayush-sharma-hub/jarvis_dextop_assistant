@@ -108,17 +108,20 @@ class Decision:
             if match:
                 try:
                     data = json.loads(match.group(0))
+                    # The outer response was malformed, so this recovery must
+                    # not authorize an action even if its embedded object does.
+                    if isinstance(data, dict):
+                        data = {**data, "action": "none"}
                 except json.JSONDecodeError:
                     data = None
 
             if data is None:
-                # Robust recovery: extract speech & action even if response was cut off by token limit
+                # Recovery is deliberately speech-only.  A malformed response must
+                # never be able to request a desktop action.
                 speech_match = re.search(r'"speech"\s*:\s*"(.*?)(?:"|\Z)', cleaned, re.DOTALL)
-                action_match = re.search(r'"action"\s*:\s*"(\w+)"', cleaned)
                 if speech_match:
                     recovered_speech = speech_match.group(1).strip()
-                    recovered_action = action_match.group(1) if action_match else "none"
-                    data = {"action": recovered_action, "speech": recovered_speech}
+                    data = {"action": "none", "speech": recovered_speech}
                 else:
                     raise BrainError("Provider did not return valid JSON") from exc
 
@@ -135,7 +138,7 @@ class Decision:
             raise BrainError(f"Provider response has invalid action ({action}) or speech")
 
         for coordinate in ("x", "y"):
-            if coordinate in data and not isinstance(data[coordinate], int):
+            if coordinate in data and (isinstance(data[coordinate], bool) or not isinstance(data[coordinate], int)):
                 raise BrainError(f"{coordinate} must be an integer")
         if action in {"move", "click", "double_click"} and ("x" not in data or "y" not in data):
             raise BrainError(f"{action} requires x and y")
@@ -149,7 +152,7 @@ class Decision:
             raise BrainError("hotkey requires a keys string array")
 
         for field in ("clicks", "scrolls"):
-            if field in data and not isinstance(data[field], int):
+            if field in data and (isinstance(data[field], bool) or not isinstance(data[field], int)):
                 raise BrainError(f"{field} must be an integer")
         if "app" in data and not isinstance(data["app"], str):
             raise BrainError("app must be a string")
@@ -333,8 +336,8 @@ class FreeWebBrain:
                     concise = ". ".join(sentences[:2]).rstrip(".") + "."
                     speech = f"{concise}"
                     return json.dumps({"action": "none", "speech": speech})
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.getLogger(self.__class__.__name__).debug("Wikipedia lookup failed: %s", exc)
 
         # Try DuckDuckGo Instant Answer API
         try:
@@ -347,8 +350,8 @@ class FreeWebBrain:
                     sentences = answer.split(". ")
                     concise = ". ".join(sentences[:2]).rstrip(".") + "."
                     return json.dumps({"action": "none", "speech": f"{concise}"})
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.getLogger(self.__class__.__name__).debug("DuckDuckGo lookup failed: %s", exc)
 
         # Only open Chrome if user explicitly demanded web search
         if any(term in command.lower() for term in ["google", "search", "browse", "net pe"]):

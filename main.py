@@ -25,6 +25,7 @@ from jarvis.config import Settings
 from jarvis.display import display
 from jarvis.intents import LocalIntentRouter
 from jarvis.memory import ConversationMemory
+from jarvis.plugins.default import build_default_registry
 from jarvis.speech import SpeechModule
 from jarvis.vision import VisionModule
 
@@ -105,6 +106,10 @@ def run() -> None:
     audio = AudioModule(settings)
     vision = VisionModule(settings)
     companion = get_companion()
+    plugins = build_default_registry(settings.action_mode, mouth.speak)
+
+    def confirm_plugin(description: str) -> bool:
+        return input(f"Allow plugin operation {description!r}? [y/N]: ").strip().lower() in {"y", "yes"}
 
     # 2. Start animated terminal display. Camera/gesture tracking is intentionally
     # absent: screenshots are captured only after an explicit screen request.
@@ -163,9 +168,11 @@ def run() -> None:
                 command = f"{command}\n\nVisible screen text (OCR):\n{ocr_text}"
                 display.add_log("SCREEN OCR", ocr_text[:240])
 
-            # Check for emotional content FIRST — highest priority
-            emotion_result = companion.detect_emotion(command)
-            if emotion_result.detected and emotion_result.response:
+            # Step 1: zero-latency local intents always take priority.
+            decision = local_intents.route(command)
+            # Step 2: companion checks only when no local intent matched.
+            emotion_result = companion.detect_emotion(command) if decision is None else None
+            if emotion_result and emotion_result.detected and emotion_result.response:
                 display.update_state("SPEAKING", f"Emotional support: {emotion_result.emotion}")
                 display.add_log("JARVIS", emotion_result.response)
                 mouth.speak(emotion_result.response)
@@ -174,7 +181,7 @@ def run() -> None:
                 continue
 
             # Check for conversational banter
-            if companion.is_conversational(command) and len(command.split()) < 8:
+            if decision is None and companion.is_conversational(command) and len(command.split()) < 8:
                 conv_reply = companion.conversational_reply(command)
                 display.update_state("SPEAKING", "Conversation mode")
                 display.add_log("JARVIS", conv_reply)
@@ -183,10 +190,19 @@ def run() -> None:
                 audio.extend_followup(15.0)
                 continue
 
-            # Step 1: Zero-latency Local Intent Router
-            decision = local_intents.route(command)
+            # Step 3: Plugins. A match never falls through to the LLM.
+            if decision is None:
+                route = plugins.route(command)
+                if route.matched:
+                    result = plugins.execute(route.plugin, command, confirm_plugin)  # type: ignore[arg-type]
+                    display.add_log("JARVIS", result.speech)
+                    display.update_state("SPEAKING", result.speech[:60])
+                    mouth.speak(result.speech)
+                    memory.add_turn(command, result.speech)
+                    audio.extend_followup(15.0)
+                    continue
 
-            # Step 2: Fall back to AI Brain (Ollama on GPU primary)
+            # Step 4: Fall back to AI Brain (Ollama on GPU primary)
             if decision is None:
                 if not brain.available_providers:
                     decision = local_intents.route("help")
@@ -230,6 +246,9 @@ def run() -> None:
             audio.extend_followup(15.0)
 
     finally:
+        timer = next((p for p in plugins._plugins.values() if p.name == "timer"), None)
+        if timer is not None:
+            timer.shutdown()  # type: ignore[attr-defined]
         stop_stats.set()
         vision.close()
         display.stop()
